@@ -1,0 +1,168 @@
+#!/usr/bin/env perl
+
+use warnings;
+use strict;
+use Digest::MD5 qw| md5 md5_hex md5_base64 |;
+use WWW::Curl::Easy;
+use Cwd;
+die "Environment not initialized!\n" if ( not defined $ENV{DESMAN_ENV} and not defined $ENV{DESMAN_CONTAINERIZER} );
+
+# dirs
+my ( $basedir, $tmpdir, $depdir, $repodir, $datadir, $docroot, $confdir, $plugins, $themes, $uploads );
+
+# files 
+my ( $ver_file, $wp_config );
+
+# misc
+my ( $wp_version, $curl, $md5, $stamp ) = ( undef, WWW::Curl::Easy->new, Digest::MD5->new, time );
+
+$basedir = "/var/www";
+$tmpdir = "/tmp";
+$repodir = "$basedir/repo";
+$datadir = "$basedir/data";
+$docroot = "$basedir/html";
+$confdir = "$repodir/config";
+$uploads = "$docroot/wp-content/uploads";
+  
+$ver_file = "$repodir/VERSION";
+$wp_config = "$confdir/wp-config.php";
+$plugins = "$repodir/plugins";
+$themes = "$repodir/themes";
+$depdir = "$tmpdir/build";
+mkdir $depdir if not -d $depdir;
+
+if ( -e $ver_file ) {
+    open(WP_VERSION,"<$ver_file");
+    $wp_version = <WP_VERSION>;
+    close(WP_VERSION);
+} else {
+    $wp_version = "4.2.2";
+}
+
+chomp($wp_version);
+
+if ( not -f "$repodir/.inetu/salt.php" ) {
+  print "Writing new SALT... ";
+  my $saltf;
+  open($saltf,">","$repodir/.inetu/salt.php") or die "Failed to open salt: $!";
+  print $saltf "<?php\n";
+  my $salturl = "https://api.wordpress.org/secret-key/1.1/salt/";
+  $curl->setopt( CURLOPT_URL, $salturl );
+  $curl->setopt( CURLOPT_WRITEDATA, \$saltf );
+  my $saltstat = $curl->perform;
+  if ( $saltstat == 0 ) {
+    print "Done\n";
+  } else {
+    warn "Failed to write new SALT";
+  }
+}
+
+
+my $build = "$depdir/$wp_version";
+
+sub getmd5 {
+    my ( $data, $pointer ) = @_;
+    ${$pointer} .= $data;
+    return length($data);
+}
+
+if ( not -f "$depdir/wordpress-$wp_version.tar.gz" ) {
+    print "Downloading WordPress Version $wp_version... \n";
+    mkdir $depdir if not -d $depdir ;
+    open(TARBALL,">","$depdir/wordpress-$wp_version.tar.gz");
+    my $url = "https://wordpress.org/wordpress-$wp_version.tar.gz";
+    my $md5url = "$url.md5";
+    my $expected_md5;
+    $curl->setopt( CURLOPT_URL, $url );
+    $curl->setopt( CURLOPT_WRITEDATA, \*TARBALL );
+    my $retcode = $curl->perform;
+    if ( $retcode == 0 ) {
+        print "Verifying archive integrity now... \n";
+        $curl = WWW::Curl::Easy->new;
+        $curl->setopt( CURLOPT_URL, $md5url );
+        $curl->setopt( CURLOPT_WRITEFUNCTION, \&getmd5 );
+        $curl->setopt( CURLOPT_FILE, \$expected_md5 );
+        my $gotmd5 = $curl->perform;
+        if ( $gotmd5 == 0 ) {
+            close(TARBALL);
+            open(TARBALL,"<","$depdir/wordpress-$wp_version.tar.gz");
+            $md5->addfile(\*TARBALL);
+            my $actual_md5 = $md5->hexdigest;
+            if ( $actual_md5 ne $expected_md5 ) {
+                warn "Downloaded archive does not match expected md5 checksum!";
+                print STDERR "expected $expected_md5 ... got $actual_md5";
+                exit 2;
+            }
+            close(TARBALL);
+        } else {
+            warn "Failed to get md5 from wordpress.org!";
+            exit 2;
+        }
+    } else {
+        warn "failed to get archive from wordpress.org";
+        exit 2;
+    }
+    close(TARBALL);
+}
+
+mkdir $build if not -d $build ;
+`/bin/tar --strip-components=1 -xzf $depdir/wordpress-$wp_version.tar.gz -C $build`;
+
+eval {
+    print "Copying Wordpress configuration in $wp_config...\n";
+    `cp -f $wp_config $build/wp-config.php`;
+} if -f $wp_config;
+
+if ( -d "$confdir/w3tc-config" ) {
+  print "Setting up W3 Total Cache... ";
+  `cp -rf $confdir/w3tc-config $build/wp-content/w3tc-config`;
+  `cp -f $confdir/w3tc-nginx.conf $build/nginx.conf` if -f "$confdir/w3tc-nginx.conf";
+  `cp -f $plugins/w3-total-cache/wp-content/advanced-cache.php $build/wp-content/advanced-cache.php`;
+  `cp -f $plugins/w3-total-cache/wp-content/object-cache.php $build/wp-content/object-cache.php`;
+  mkdir "$build/wp-content/cache" if not -d "$build/wp-content/cache";
+  print "Done\n";
+}
+
+print "Copying WordPress plugins from repository... ";
+`/usr/bin/rsync -r $plugins/ $build/wp-content/plugins/ 2>/dev/null`;
+print "Done\nCopying WordPress themes from repository... ";
+`/usr/bin/rsync -r $themes/ $build/wp-content/themes/ 2>/dev/null`;
+print "Done\n";
+
+print "Copying build files to installdir now... ";
+qx|/usr/bin/rsync -av --delete --force $build/ $docroot/ 2>/dev/null|;
+print "Done\n";
+
+mkdir $datadir if not -d $datadir ;
+mkdir "$datadir/uploads" if not -d "$datadir/uploads";
+mkdir "$datadir/blogs.dir" if not -d "$datadir/blogs.dir";
+
+symlink "$datadir/blogs.dir", "$docroot/wp-content/blogs.dir";
+symlink "$plugins", "$docroot/wp-content/plugins";
+symlink "$themes", "$docroot/wp-content/themes";
+symlink "$datadir/uploads", $uploads;
+
+qx|rm -rf $build 2>/dev/null|;
+
+# can be removed
+if ( not defined $ENV{DESMAN_CONTAINERIZER} or $ENV{DESMAN_CONTAINERIZER} ne "docker" ) {
+  # Fix up permissions in IaaS
+  if ( defined $ENV{DESMAN_ENV} ) {
+    # set group to nfsnobody in stage and prod
+    my $group = 'nfsnobody';
+    my $dperm = '2755';
+    my $fperm = '0644';
+    if ( $ENV{DESMAN_ENV} eq 'devel' ) {
+      $group = qx|basename `dirname $basedir`|;
+      $dperm = '2775';
+      $fperm = '0664';
+    } 
+    chomp($group);
+    qx|chown -R nobody:nobody $docroot|;
+    qx|chown -R www-data:www-data $datadir|;
+    qx|find $datadir/uploads -type f -exec chmod $fperm {} \\;|;
+    qx|find $datadir/uploads -type d -exec chmod $dperm {} \\;|;
+    qx|chown apache:nfsnobody $docroot/wp-content/cache $docroot/wp-content/w3tc-config| if -d "$docroot/wp-content/w3tc-config";
+    qx|chmod 755 $docroot/wp-content/cache $docroot/wp-content/w3tc-config| if -d "$docroot/wp-content/w3tc-config";
+  }
+}

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+echo "creating $DESMAN_MYSQL_DB_NAME if not exists"
+
+mysql -h $DESMAN_MYSQL_DB_HOST -u $DESMAN_MYSQL_DB_USERNAME -p$DESMAN_MYSQL_DB_PASSWORD -e "CREATE DATABASE IF NOT EXISTS $DESMAN_MYSQL_DB_NAME;"
+
+
+
+nginx && php-fpm
